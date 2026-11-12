@@ -7,6 +7,10 @@ services:
     environment:
       DEMUX_TMP_ROOT: /tmp/demux
       LOG_LEVEL: INFO
+      # Per-process capacity. Keep the API at one uvicorn worker: these limits
+      # describe the whole service, not each worker.
+      DEMUX_MAX_INFLIGHT: ${DEMUX_MAX_INFLIGHT:-2}
+      DEMUX_TMP_BUDGET_BYTES: ${DEMUX_TMP_BUDGET_BYTES:-268435456}
     restart: unless-stopped
     init: true
     healthcheck:

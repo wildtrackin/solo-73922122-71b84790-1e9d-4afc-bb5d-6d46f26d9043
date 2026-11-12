@@ -17,7 +17,10 @@ import zipfile
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Iterable, Sequence
+from typing import TYPE_CHECKING, BinaryIO, Iterable, Sequence
+
+if TYPE_CHECKING:  # avoid a runtime import cycle
+    from .resources import RequestLease
 
 MAX_BARCODES = 16
 BARCODE_LENGTH = 8
@@ -41,6 +44,11 @@ class DemuxError(Exception):
     record: int | None = None
     line: int | None = None
     locations: dict[str, dict[str, int]] | None = None
+    budget_bytes: int | None = None
+    used_bytes: int | None = None
+    required_bytes: int | None = None
+    available_bytes: int | None = None
+    retry_after: str | None = None
     status_code: int = 400
 
     def __str__(self) -> str:  # pragma: no cover - convenience only
@@ -56,6 +64,14 @@ class DemuxError(Exception):
             detail["line"] = self.line
         if self.locations is not None:
             detail["locations"] = self.locations
+        if self.budget_bytes is not None:
+            detail["budget_bytes"] = self.budget_bytes
+        if self.used_bytes is not None:
+            detail["used_bytes"] = self.used_bytes
+        if self.required_bytes is not None:
+            detail["required_bytes"] = self.required_bytes
+        if self.available_bytes is not None:
+            detail["available_bytes"] = self.available_bytes
         return detail
 
 
@@ -368,15 +384,18 @@ class Group:
 
 
 class _GzipSink:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, lease: "RequestLease | None" = None):
+        from .resources import BudgetedWriter
+
         self.path = path
         self._fp = open(path, "wb")
+        self._writer = BudgetedWriter(self._fp, lease)
         try:
             self._gz = gzip.GzipFile(
-                fileobj=self._fp, mode="wb", compresslevel=1, mtime=0
+                fileobj=self._writer, mode="wb", compresslevel=1, mtime=0
             )
         except BaseException:
-            self._fp.close()
+            self._writer.close()
             raise
 
     def write(self, raw: bytes) -> None:
@@ -386,11 +405,16 @@ class _GzipSink:
         try:
             self._gz.close()
         finally:
-            self._fp.close()
+            self._writer.close()
 
 
 class _GroupSinks:
-    def __init__(self, tmpdir: Path, barcodes: Sequence[str]):
+    def __init__(
+        self,
+        tmpdir: Path,
+        barcodes: Sequence[str],
+        lease: "RequestLease | None" = None,
+    ):
         self.groups: dict[str, Group] = {}
         self.sinks: dict[tuple[str, str], _GzipSink] = {}
         for barcode in barcodes:
@@ -409,8 +433,8 @@ class _GroupSinks:
         try:
             for name, group in self.groups.items():
                 assert group.r1_path is not None and group.r2_path is not None
-                self.sinks[(name, "R1")] = _GzipSink(group.r1_path)
-                self.sinks[(name, "R2")] = _GzipSink(group.r2_path)
+                self.sinks[(name, "R1")] = _GzipSink(group.r1_path, lease)
+                self.sinks[(name, "R2")] = _GzipSink(group.r2_path, lease)
         except BaseException:
             self.close()
             raise
@@ -474,7 +498,14 @@ class DemuxPackage:
             pass
 
 
-def _build_zip(tmpdir: Path, groups: Iterable[Group], manifest: dict) -> Path:
+def _build_zip(
+    tmpdir: Path,
+    groups: Iterable[Group],
+    manifest: dict,
+    lease: "RequestLease | None" = None,
+) -> Path:
+    from .resources import BudgetedWriter
+
     zip_path = tmpdir / "package.zip"
     tsv = ["group\tbarcode\tpair_count\tr1_file\tr2_file"]
     for group in groups:
@@ -485,22 +516,23 @@ def _build_zip(tmpdir: Path, groups: Iterable[Group], manifest: dict) -> Path:
             f"{prefix}_R1.fastq.gz\t{prefix}_R2.fastq.gz"
         )
 
-    with zipfile.ZipFile(
-        zip_path, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
-    ) as archive:
-        archive.writestr(
-            "manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
-        archive.writestr("pair_counts.tsv", ("\n".join(tsv) + "\n").encode("utf-8"))
-        for group in groups:
-            assert group.r1_path is not None and group.r2_path is not None
-            archive.write(
-                group.r1_path, arcname=f"{group.name}/{group.name}_R1.fastq.gz"
+    with BudgetedWriter(open(zip_path, "wb"), lease) as budgeted:
+        with zipfile.ZipFile(
+            budgeted, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
+        ) as archive:
+            archive.writestr(
+                "manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
             )
-            archive.write(
-                group.r2_path, arcname=f"{group.name}/{group.name}_R2.fastq.gz"
-            )
+            archive.writestr("pair_counts.tsv", ("\n".join(tsv) + "\n").encode("utf-8"))
+            for group in groups:
+                assert group.r1_path is not None and group.r2_path is not None
+                archive.write(
+                    group.r1_path, arcname=f"{group.name}/{group.name}_R1.fastq.gz"
+                )
+                archive.write(
+                    group.r2_path, arcname=f"{group.name}/{group.name}_R2.fastq.gz"
+                )
     return zip_path
 
 
@@ -510,34 +542,51 @@ def prepare_package(
     barcodes: Sequence[str],
     *,
     tmp_root: str | Path | None = None,
+    tmpdir: str | Path | None = None,
+    lease: "RequestLease | None" = None,
 ) -> DemuxPackage:
     """Validate and demultiplex two gzip FASTQ streams into a ZIP package.
 
-    On success the caller owns the returned package and must call
-    ``cleanup()``.  On every error the temporary directory is removed before
-    the exception is raised.
+    ``tmpdir`` may be supplied by the HTTP layer so that upload spools and
+    output files share one request-owned directory.  ``lease`` enables
+    stop-signal checks and byte-budgeted writing; without it the core is a
+    plain stdlib demultiplexer.
+
+    On success the caller owns the returned package and must clean it up.
+    When this function created its own temporary directory, every error also
+    removes that directory before the exception is raised.
     """
 
     # Revalidate here as well: this function is useful without the HTTP layer.
     normalized = normalize_barcodes(list(barcodes))
-    tmp_root_path = Path(tmp_root) if tmp_root is not None else None
-    if tmp_root_path is not None:
-        tmp_root_path.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(
-        tempfile.mkdtemp(prefix="demux-", dir=str(tmp_root_path) if tmp_root_path else None)
-    )
+    owns_tmpdir = tmpdir is None
+    if tmpdir is None:
+        tmp_root_path = Path(tmp_root) if tmp_root is not None else None
+        if tmp_root_path is not None:
+            tmp_root_path.mkdir(parents=True, exist_ok=True)
+        tmpdir_path = Path(
+            tempfile.mkdtemp(
+                prefix="demux-", dir=str(tmp_root_path) if tmp_root_path else None
+            )
+        )
+    else:
+        tmpdir_path = Path(tmpdir)
 
     r1_stream: FastqStream | None = None
     r2_stream: FastqStream | None = None
     sinks: _GroupSinks | None = None
     keep_tmpdir = False
     try:
+        if lease is not None:
+            lease.ensure_active()
         r1_stream = FastqStream(r1_fileobj, "R1")
         r2_stream = FastqStream(r2_fileobj, "R2")
-        sinks = _GroupSinks(tmpdir, normalized)
+        sinks = _GroupSinks(tmpdir_path, normalized, lease)
 
         pair_count = 0
         while True:
+            if lease is not None:
+                lease.ensure_active()
             next_pair = pair_count + 1
             r1_record = r1_stream.read_record()
             r2_record = r2_stream.read_record()
@@ -609,9 +658,9 @@ def prepare_package(
                 for group in groups
             ],
         }
-        zip_path = _build_zip(tmpdir, groups, manifest)
+        zip_path = _build_zip(tmpdir_path, groups, manifest, lease)
         keep_tmpdir = True
-        return DemuxPackage(tmpdir=tmpdir, zip_path=zip_path, manifest=manifest)
+        return DemuxPackage(tmpdir=tmpdir_path, zip_path=zip_path, manifest=manifest)
     finally:
         try:
             if sinks is not None:
@@ -625,5 +674,5 @@ def prepare_package(
                 r2_stream.close()
         except BaseException:
             pass
-        if not keep_tmpdir:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+        if owns_tmpdir and not keep_tmpdir:
+            shutil.rmtree(tmpdir_path, ignore_errors=True)
